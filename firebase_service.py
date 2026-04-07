@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -32,23 +33,76 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
         return default
 
 
+def _load_firebase_credential() -> Optional[credentials.Certificate]:
+    """Load Firebase Admin credentials from JSON text or a local file."""
+    creds_json = get_secret("FIREBASE_CREDENTIALS")
+    if creds_json:
+        cleaned = creds_json.strip().lstrip("\ufeff")
+        if not cleaned:
+            logger.error("FIREBASE_CREDENTIALS is set but empty.")
+            return None
+
+        candidates = [cleaned]
+        if cleaned.startswith(('"', "'")) and cleaned.endswith(('"', "'")):
+            candidates.append(cleaned[1:-1])
+
+        last_error: Optional[Exception] = None
+        for candidate in candidates:
+            try:
+                creds_dict = json.loads(candidate)
+                private_key = creds_dict.get("private_key")
+                if isinstance(private_key, str):
+                    creds_dict["private_key"] = private_key.replace("\\n", "\n")
+                return credentials.Certificate(creds_dict)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+            except Exception as exc:
+                logger.error("Failed to parse FIREBASE_CREDENTIALS: %s", exc)
+                return None
+
+        try:
+            decoded = base64.b64decode(cleaned).decode("utf-8")
+            creds_dict = json.loads(decoded)
+            private_key = creds_dict.get("private_key")
+            if isinstance(private_key, str):
+                creds_dict["private_key"] = private_key.replace("\\n", "\n")
+            return credentials.Certificate(creds_dict)
+        except Exception:
+            logger.error("FIREBASE_CREDENTIALS is not valid JSON: %s", last_error)
+            return None
+
+    local_file = get_secret("FIREBASE_CREDENTIALS_PATH", DEFAULT_FIREBASE_FILE)
+    if not local_file or not os.path.exists(local_file):
+        logger.warning("Firebase credentials file not found: %s", local_file)
+        return None
+
+    try:
+        return credentials.Certificate(local_file)
+    except Exception as exc:
+        logger.error("Failed to load Firebase credentials from file %s: %s", local_file, exc)
+        return None
+
+
+def ensure_firebase_initialized() -> bool:
+    """Ensure the Firebase Admin SDK is initialized before auth/database operations."""
+    if firebase_admin._apps:
+        return True
+
+    client = initialize_firebase()
+    return bool(firebase_admin._apps or client is not None)
+
+
 @st.cache_resource(show_spinner=False)
 def initialize_firebase() -> Optional[firestore.Client]:
-    """Initialize Firebase once and return a Firestore client."""
+    """Initialize Firebase once and return a Firestore client when available."""
     try:
         if firebase_admin._apps:
             return firestore.client()
 
-        creds_json = get_secret("FIREBASE_CREDENTIALS")
-        if creds_json:
-            creds_dict = json.loads(creds_json)
-            cred = credentials.Certificate(creds_dict)
-        else:
-            local_file = get_secret("FIREBASE_CREDENTIALS_PATH", DEFAULT_FIREBASE_FILE)
-            if not local_file or not os.path.exists(local_file):
-                logger.warning("Firebase credentials file not found: %s", local_file)
-                return None
-            cred = credentials.Certificate(local_file)
+        cred = _load_firebase_credential()
+        if cred is None:
+            logger.error("Firebase initialization skipped because no valid Admin credentials were found.")
+            return None
 
         firebase_admin.initialize_app(cred)
         logger.info("Firebase initialized successfully")
@@ -58,7 +112,7 @@ def initialize_firebase() -> Optional[firestore.Client]:
         return None
 
 
-db = initialize_firebase()
+db: Optional[firestore.Client] = None
 
 
 class FirebaseAuth:
@@ -67,33 +121,64 @@ class FirebaseAuth:
     @staticmethod
     def sign_up(email: str, password: str, display_name: Optional[str] = None) -> Dict[str, Any]:
         """Create a new Firebase Authentication user."""
+        api_key = get_secret("FIREBASE_WEB_API_KEY")
+        if not api_key:
+            message = "FIREBASE_WEB_API_KEY is not configured."
+            logger.error(message)
+            return {"success": False, "user_id": None, "message": message}
+
+        endpoint = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={api_key}"
+        payload = {
+            "email": email,
+            "password": password,
+            "returnSecureToken": True,
+        }
+
         try:
-            initialize_firebase()
-            user = auth.create_user(
-                email=email,
-                password=password,
-                display_name=display_name or email.split("@")[0],
-            )
-            logger.info("Firebase user created successfully: %s", user.uid)
+            response = requests.post(endpoint, json=payload, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            user_id = data.get("localId")
+
+            if ensure_firebase_initialized() and user_id:
+                try:
+                    auth.update_user(user_id, display_name=display_name or email.split("@")[0])
+                except Exception as exc:
+                    logger.warning("Unable to update Firebase display name for %s: %s", user_id, exc)
+
+            logger.info("Firebase user created successfully: %s", user_id)
             return {
                 "success": True,
-                "user_id": user.uid,
+                "user_id": user_id,
                 "message": "Account created successfully.",
-                "email": user.email,
-                "display_name": user.display_name,
+                "email": data.get("email", email),
+                "display_name": display_name or email.split("@")[0],
             }
-        except Exception as exc:
-            error_text = str(exc).lower()
-            if "already exists" in error_text:
+        except requests.HTTPError:
+            error_payload = response.json() if response.content else {}
+            firebase_message = (
+                error_payload.get("error", {}).get("message", "") if isinstance(error_payload, dict) else ""
+            )
+            normalized = firebase_message.upper()
+            if normalized == "EMAIL_EXISTS":
                 message = "Email already exists. Please use a different email."
-            elif "invalid email" in error_text:
+            elif normalized == "INVALID_EMAIL":
                 message = "Invalid email format."
-            elif "password" in error_text:
+            elif normalized in {"WEAK_PASSWORD : PASSWORD SHOULD BE AT LEAST 6 CHARACTERS", "WEAK_PASSWORD"}:
                 message = "Password is too weak. Please use at least 6 characters."
+            elif normalized == "PASSWORD_LOGIN_DISABLED":
+                message = "Email/password sign-in is disabled in Firebase Console. Enable it under Authentication > Sign-in method."
             else:
-                message = f"Error creating account: {exc}"
-            logger.error("Firebase sign-up failed: %s", exc)
+                message = f"Error creating account: {firebase_message or response.text}"
+            logger.error("Firebase sign-up failed: %s", response.text)
             return {"success": False, "user_id": None, "message": message}
+        except requests.RequestException as exc:
+            logger.error("Firebase sign-up request failed: %s", exc)
+            return {
+                "success": False,
+                "user_id": None,
+                "message": "Authentication service is temporarily unavailable.",
+            }
 
     @staticmethod
     def verify_email(email: str, password: str) -> Dict[str, Any]:
@@ -122,7 +207,17 @@ class FirebaseAuth:
                 "email": data.get("email", email),
             }
         except requests.HTTPError:
+            error_payload = response.json() if response.content else {}
+            firebase_message = (
+                error_payload.get("error", {}).get("message", "") if isinstance(error_payload, dict) else ""
+            )
             logger.error("Firebase login rejected for %s: %s", email, response.text)
+            if firebase_message == "PASSWORD_LOGIN_DISABLED":
+                return {
+                    "success": False,
+                    "user_id": None,
+                    "message": "Email/password sign-in is disabled in Firebase Console. Enable it under Authentication > Sign-in method.",
+                }
             return {"success": False, "user_id": None, "message": "Invalid email or password."}
         except requests.RequestException as exc:
             logger.error("Firebase login request failed: %s", exc)
@@ -136,7 +231,10 @@ class FirebaseAuth:
     def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
         """Retrieve a Firebase user by email address."""
         try:
-            initialize_firebase()
+            if not ensure_firebase_initialized():
+                logger.error("Firebase is not initialized; cannot get user by email.")
+                return None
+
             user = auth.get_user_by_email(email)
             return {
                 "user_id": user.uid,
@@ -153,7 +251,10 @@ class FirebaseAuth:
     def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a Firebase user by UID."""
         try:
-            initialize_firebase()
+            if not ensure_firebase_initialized():
+                logger.error("Firebase is not initialized; cannot get user by id.")
+                return None
+
             user = auth.get_user(user_id)
             return {
                 "user_id": user.uid,
@@ -202,7 +303,9 @@ class FirebaseDB:
     @staticmethod
     def _client() -> Optional[firestore.Client]:
         """Return a live Firestore client, if available."""
-        return initialize_firebase()
+        global db
+        db = initialize_firebase()
+        return db
 
     @staticmethod
     def create_user(user_id: str, email: str, name: str) -> bool:

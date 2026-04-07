@@ -18,8 +18,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-GROQ_MODEL = "llama3-8b-8192"
-OPENAI_MODEL = "gpt-4o-mini"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 REQUEST_TIMEOUT = 30
 MAX_QUERY_LENGTH = 5000
 MAX_HISTORY_MESSAGES = 10
@@ -81,13 +81,32 @@ def retry_api_call(func: Callable[..., str]) -> Callable[..., str]:
     @wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> str:
         last_error: Optional[Exception] = None
+        service_name = "Groq" if "groq" in func.__name__.lower() else "OpenAI"
+        api_key_name = "GROQ_API_KEY" if service_name == "Groq" else "OPENAI_API_KEY"
 
         for attempt in range(1, 4):
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
                 last_error = exc
+                error_name = exc.__class__.__name__
                 is_timeout = isinstance(exc, (TimeoutException, TimeoutError)) or "timeout" in str(exc).lower()
+
+                if error_name == "AuthenticationError":
+                    logger.error("%s authentication failed: %s", service_name, exc)
+                    return f"{service_name} authentication failed. Check `{api_key_name}` in Render."
+                if error_name == "RateLimitError":
+                    logger.error("%s rate limit reached: %s", service_name, exc)
+                    return f"{service_name} rate limit reached. Please try again in a minute."
+                if error_name == "BadRequestError":
+                    logger.error("%s request was rejected: %s", service_name, exc)
+                    if service_name == "Groq":
+                        return "Groq rejected the request. Check the `GROQ_MODEL` setting or account access."
+                    return f"{service_name} rejected the request. Please review the model configuration."
+                if error_name == "APIConnectionError":
+                    logger.error("%s connection error: %s", service_name, exc)
+                    return f"Unable to reach {service_name} right now. Please try again shortly."
+
                 log_message = "Request timed out" if is_timeout else "Request failed"
                 logger.warning("%s in %s (attempt %s/3): %s", log_message, func.__name__, attempt, exc)
 
@@ -97,11 +116,11 @@ def retry_api_call(func: Callable[..., str]) -> Callable[..., str]:
 
                 logger.error("%s failed after retries: %s", func.__name__, exc)
                 if is_timeout:
-                    return "The request timed out after multiple attempts. Please try again."
-                return "The AI service is temporarily unavailable right now. Please try again in a moment."
+                    return f"The {service_name} request timed out after multiple attempts. Please try again."
+                return f"The {service_name} service is temporarily unavailable right now. Please try again in a moment."
 
         logger.error("Unexpected retry exit for %s: %s", func.__name__, last_error)
-        return "The AI service is temporarily unavailable right now. Please try again in a moment."
+        return f"The {service_name} service is temporarily unavailable right now. Please try again in a moment."
 
     return wrapper
 
@@ -139,9 +158,10 @@ def get_response_from_groq(
     messages.extend(_trim_chat_history(groq_chat_history))
     messages.append({"role": "user", "content": user_query})
 
-    logger.info("Sending Groq request with %s context messages.", len(messages) - 1)
+    selected_model = get_secret("GROQ_MODEL", GROQ_MODEL) or GROQ_MODEL
+    logger.info("Sending Groq request with model %s and %s context messages.", selected_model, len(messages) - 1)
     completion = client.chat.completions.create(
-        model=GROQ_MODEL,
+        model=selected_model,
         messages=messages,
         temperature=0.3,
         max_tokens=1000,
