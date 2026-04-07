@@ -1,0 +1,13 @@
+.env
+*.json
+!.streamlit/config.toml
+__pycache__/
+.venv/
+venv/
+.streamlit/secrets.toml
+.git/
+.gitignore
+.vscode/
+.idea/
+*.pyc
+*.pyo
