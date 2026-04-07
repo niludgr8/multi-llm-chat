@@ -9,13 +9,23 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-import streamlit as st
 from dotenv import load_dotenv
+import streamlit as st
+
+load_dotenv()
+
+APP_TITLE = os.getenv("APP_TITLE", "Multi-LLM Chat") or "Multi-LLM Chat"
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="💬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 from firebase_service import FirebaseAuth, FirebaseDB, initialize_firebase
 from llm_functions import DEFAULT_SYSTEM_PROMPT, get_openai_response2, get_response_from_groq
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -24,21 +34,15 @@ MAX_QUERY_LENGTH = 5000
 
 
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Read secrets from Streamlit first, then environment variables."""
+    """Read environment variables first, then fall back to Streamlit secrets."""
+    env_value = os.getenv(key)
+    if env_value is not None:
+        return env_value
+
     try:
         return st.secrets[key]
     except Exception:
-        return os.getenv(key, default)
-
-
-APP_TITLE = get_secret("APP_TITLE", "Multi-LLM Chat") or "Multi-LLM Chat"
-
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="💬",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+        return default
 
 st.markdown(
     """

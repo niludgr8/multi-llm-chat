@@ -29,11 +29,15 @@ T = TypeVar("T")
 
 
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Read secrets from Streamlit first, then environment variables."""
+    """Read environment variables first, then fall back to Streamlit secrets."""
+    env_value = os.getenv(key)
+    if env_value is not None:
+        return env_value
+
     try:
         return st.secrets[key]
     except Exception:
-        return os.getenv(key, default)
+        return default
 
 
 @st.cache_resource(show_spinner=False)
